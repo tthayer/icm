@@ -168,6 +168,17 @@ pub struct ExtractionConfig {
     pub max_facts: usize,
     /// Extract every N tool calls (hook counter).
     pub extract_every: usize,
+    /// Maximum rows the async drain worker (`icm extract-pending`, forked at
+    /// SessionEnd / PreCompact) processes per run.
+    ///
+    /// The async path enqueues one row every `extract_every` tool calls, so
+    /// the drain has to keep up: a heavy session can enqueue far more than a
+    /// small limit removes, and `pending_extractions` then grows without
+    /// bound (a real store reached ~2,700 rows this way while the limit was a
+    /// hardcoded 20). Larger values mean bigger LLM prompts — every pending
+    /// row of a project goes into one prompt — so raise it only as far as the
+    /// provider tolerates.
+    pub drain_limit: usize,
     /// Store raw text as fallback when no facts are extracted.
     pub store_raw: bool,
     /// LLM extraction from the conversation itself (`[extraction.conversation]`).
@@ -461,6 +472,7 @@ impl Default for ExtractionConfig {
             min_score: 2.0,
             max_facts: 20,
             extract_every: 3,
+            drain_limit: 50,
             store_raw: true,
             conversation: ConversationExtractionConfig::default(),
             // Default = auto: detect an installed LLM CLI and route
@@ -623,6 +635,7 @@ decay_rate = 0.90
         // Other fields should be defaults
         assert!(config.extraction.enabled);
         assert_eq!(config.memory.hook_events_retention_days, 30);
+        assert_eq!(config.extraction.drain_limit, 50);
     }
 
     #[test]

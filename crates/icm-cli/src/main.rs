@@ -4648,7 +4648,8 @@ fn cmd_hook_compact(
         && extraction_cfg.summarizer.provider != "none"
     {
         if enqueue_conversation(store, &input, extraction_cfg, "pre-compact", true) > 0 {
-            spawn_detached_worker(&["extract-pending", "--limit", "20"], "extraction");
+            let limit = extraction_cfg.drain_limit.to_string();
+            spawn_detached_worker(&["extract-pending", "--limit", &limit], "extraction");
         }
         return Ok(());
     }
@@ -4896,7 +4897,9 @@ fn cmd_hook_end(
         // and let the child outlive us. The child reads the same
         // config so it picks up the same provider.
         let mut cmd = std::process::Command::new(&self_path);
-        cmd.arg("extract-pending").arg("--limit").arg("20");
+        cmd.arg("extract-pending")
+            .arg("--limit")
+            .arg(extraction_cfg.drain_limit.to_string());
         // Mark the worker subtree (#322) so any hook fired by an LLM
         // CLI it spawns short-circuits instead of forking again.
         cmd.env("ICM_WORKER", "1");
@@ -5292,7 +5295,8 @@ fn cmd_hook_prompt(
         && std::env::var_os("ICM_WORKER").is_none()
         && enqueue_conversation(store, &input, extraction_cfg, "prompt", false) > 0
     {
-        spawn_detached_worker(&["extract-pending", "--limit", "20"], "extraction");
+        let limit = extraction_cfg.drain_limit.to_string();
+        spawn_detached_worker(&["extract-pending", "--limit", &limit], "extraction");
     }
 
     Ok(())
