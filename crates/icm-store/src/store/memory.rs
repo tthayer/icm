@@ -292,12 +292,18 @@ impl MemoryStore for SqliteStore {
             return Ok(Vec::new());
         }
 
+        // Drive the scan from the FTS index and look matching rows up by
+        // rowid. The previous `id IN (SELECT id FROM memories_fts …)` shape
+        // made SQLite scan every `memories` row and test membership against
+        // the matched set (O(table) per query); `EXPLAIN QUERY PLAN` showed
+        // `SEARCH memories` as the outer loop. `… JOIN … ON m.rowid =
+        // fts.rowid` puts `SCAN fts` first and `SEARCH m USING INTEGER
+        // PRIMARY KEY` second, so cost follows the match count.
         let sql = format!(
-            "SELECT {SELECT_COLS} FROM memories
-             WHERE id IN (
-                 SELECT id FROM memories_fts WHERE memories_fts MATCH ?1
-             )
-             ORDER BY weight DESC
+            "SELECT {SELECT_COLS_M} FROM memories_fts fts
+             JOIN memories m ON m.rowid = fts.rowid
+             WHERE memories_fts MATCH ?1
+             ORDER BY m.weight DESC
              LIMIT ?2"
         );
 

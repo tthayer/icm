@@ -105,6 +105,13 @@ pub(crate) const SELECT_COLS: &str = "id, created_at, updated_at, last_accessed,
                            topic, summary, raw_excerpt, keywords, \
                            importance, source_type, source_data, related_ids, embedding";
 
+/// [`SELECT_COLS`] qualified with the `memories` alias `m`, for queries that
+/// also reference `memories_fts` (both expose `id`/`topic`/`summary`/`keywords`,
+/// so the unqualified list is ambiguous there).
+pub(crate) const SELECT_COLS_M: &str = "m.id, m.created_at, m.updated_at, m.last_accessed, m.access_count, m.weight, \
+                           m.topic, m.summary, m.raw_excerpt, m.keywords, \
+                           m.importance, m.source_type, m.source_data, m.related_ids, m.embedding";
+
 /// Sanitize a query string for FTS5 MATCH.
 ///
 /// FTS5 treats characters like `-`, `*`, `"`, `:`, `^`, `+`, `~` as operators.
