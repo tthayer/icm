@@ -49,7 +49,7 @@ use icm_core::{
     Embedder, Importance, MSG_NO_MEMORIES, Memory, MemoryStore, is_preference_topic,
     keyword_matches, project_matches, topic_matches,
 };
-use icm_store::{RecallEngine, RecallRequest, Store};
+use icm_store::{PooledStore, RecallEngine, RecallRequest, Store, StorePool};
 
 use crate::recall_format::{self, RecallFormat};
 
@@ -57,15 +57,15 @@ use crate::recall_format::{self, RecallFormat};
 // Shared state
 // ---------------------------------------------------------------------------
 
-/// Arc-shared so every axum handler reads the SAME warm store + embedder.
-/// `Store` wraps a `rusqlite::Connection`, which is `Send` but
-/// not `Sync`, so the same `Arc<Mutex<…>>` pattern as the web
-/// dashboard (see `web.rs`) serializes DB access. Embedders are
-/// already `Send + Sync` (see `icm-core::embedder::Embedder`).
+/// Arc-shared so every axum handler reads a warm store **pool** + embedder.
+/// A `rusqlite::Connection` is `Send` but not `Sync`; a single connection
+/// behind a `Mutex` serialized every request. `StorePool` hands each in-flight
+/// request its own connection instead (#1). Embedders are already
+/// `Send + Sync` (see `icm-core::embedder::Embedder`).
 /// `None` skips semantic recall — the `--no-embeddings` path.
 #[derive(Clone)]
 pub struct AppState {
-    store: Arc<Mutex<Store>>,
+    store: Arc<StorePool>,
     embedder: Option<Arc<dyn Embedder + Send + Sync>>,
     mcp_calls_since_store: Arc<Mutex<u32>>,
     auto_consolidate: icm_mcp::AutoConsolidate,
@@ -76,22 +76,11 @@ pub struct AppState {
     token: Option<String>,
 }
 
-/// Audit finding: every store access here treated a poisoned Mutex as a
-/// *permanent* fault ("store poisoned", 500) rather than recovering, unlike
-/// `web.rs::lock_store` (fixed in #372) — a single panic anywhere in Store
-/// while the lock was held (a future bug, an upstream edge case) would
-/// permanently 500 all five endpoints (recall/store/consolidate/stats/
-/// topics) for the rest of the process, recoverable only by restarting
-/// `icm serve --http`. A stdlib Mutex poison flag carries no corruption
-/// guarantee for a plain data store — the guard's data is still valid,
-/// just possibly mid-mutation from the panicking call, which the store's
-/// own operations are already robust to (each is a self-contained SQL
-/// statement/transaction).
-fn lock_store(state: &AppState) -> std::sync::MutexGuard<'_, Store> {
-    state
-        .store
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// Check out a connection from the pool for this request. Blocks while every
+/// member is busy (never fails). The guard returns the connection on drop and
+/// is `!Send`, so it cannot be held across an `await`.
+fn lock_store(state: &AppState) -> PooledStore<'_> {
+    state.store.checkout()
 }
 
 impl AppState {
@@ -245,7 +234,7 @@ fn check_bind_requires_token(addr: &SocketAddr, token: &Option<String>) -> Resul
 /// are pre-built by `cmd_serve` and handed to us as `Arc`s.
 #[tokio::main]
 pub async fn run_http_server(
-    store: Store,
+    store_pool: StorePool,
     embedder: Option<Box<dyn Embedder + Send + Sync>>,
     addr: SocketAddr,
     token: Option<String>,
@@ -261,7 +250,7 @@ pub async fn run_http_server(
         anyhow::bail!(msg);
     }
     let state = AppState {
-        store: Arc::new(Mutex::new(store)),
+        store: Arc::new(store_pool),
         embedder: embedder.map(Arc::from),
         mcp_calls_since_store: Arc::new(Mutex::new(0)),
         auto_consolidate,
@@ -1194,36 +1183,25 @@ mod tests {
     /// lock_store (fixed in #372) — a single panic anywhere in Store while
     /// the lock was held would permanently break recall/store/consolidate/
     /// stats/topics for the rest of the process.
+    /// The pool (issue #1) replaced the shared `Mutex<Store>`. A panic while a
+    /// request holds a connection must not lose it: `PooledStore::drop` runs
+    /// during unwinding and returns the member, and the pool never poisons.
     #[test]
-    fn lock_store_recovers_from_a_poisoned_mutex() {
-        let state = AppState {
-            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
-            embedder: None,
-            mcp_calls_since_store: Arc::new(Mutex::new(0)),
-            auto_consolidate: icm_mcp::AutoConsolidate {
-                enabled: false,
-                threshold: 10,
-                queue: false,
-            },
-            mcp_instructions: None,
-            token: None,
-        };
-
-        // Poison the mutex: panic while holding the guard on another thread.
-        let poisoner = state.clone();
+    fn a_panicking_request_returns_its_connection_to_the_pool() {
+        let state = test_state(Store::in_memory().unwrap(), false);
+        let before = state.store.idle_len();
+        let clone = state.clone();
         let _ = std::thread::spawn(move || {
-            let _guard = poisoner.store.lock().unwrap();
-            panic!("intentional poison");
+            let _guard = lock_store(&clone);
+            panic!("intentional panic while holding a connection");
         })
         .join();
-        assert!(state.store.is_poisoned(), "setup: mutex must be poisoned");
-
-        // The recovering lock still yields a working store.
-        let store = lock_store(&state);
-        assert!(
-            store.stats().is_ok(),
-            "store must remain usable after poison"
+        assert_eq!(
+            state.store.idle_len(),
+            before,
+            "the connection must be back in the pool after the panic"
         );
+        assert!(lock_store(&state).stats().is_ok());
     }
 
     /// Manual-testing finding (against the real HTTP server): a third,
@@ -1266,7 +1244,7 @@ mod tests {
             .unwrap();
 
         let state = AppState {
-            store: Arc::new(Mutex::new(store)),
+            store: Arc::new(StorePool::from_single(store)),
             embedder: Some(Arc::new(StubEmbedder)),
             mcp_calls_since_store: Arc::new(Mutex::new(0)),
             auto_consolidate: icm_mcp::AutoConsolidate {
@@ -1460,7 +1438,7 @@ mod tests {
 
     fn test_state(store: Store, with_embedder: bool) -> AppState {
         AppState {
-            store: Arc::new(Mutex::new(store)),
+            store: Arc::new(StorePool::from_single(store)),
             embedder: with_embedder
                 .then(|| Arc::new(WordEmbedder) as Arc<dyn Embedder + Send + Sync>),
             mcp_calls_since_store: Arc::new(Mutex::new(0)),

@@ -48,6 +48,10 @@ pub use common::{CodeArea, HookEvent, HookEventInsert, HookStatsRow, PendingRow}
 // The runtime-dispatched store and the backend selector.
 pub use backend::{BackendKind, Store};
 
+// A pool of independent Store connections over one database file (#1).
+mod pool;
+pub use pool::{PooledStore, StorePool, default_pool_size};
+
 // The v2 recall pipeline (rank fusion, token budget), shared by the HTTP,
 // MCP and CLI surfaces.
 pub use recall::{RecallEngine, RecallHit, RecallOutcome, RecallRequest, recall_v2};

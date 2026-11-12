@@ -2988,8 +2988,17 @@ fn main() -> Result<()> {
             #[cfg(feature = "web")]
             if expose {
                 let password = web::resolve_password(&cfg.web)?;
-                return web::run_web_server(
+                let store_is_readonly = store.is_readonly();
+                let pool = icm_store::StorePool::with_seed(
                     store,
+                    &db_path,
+                    embedding_dims,
+                    store_is_readonly,
+                    icm_store::default_pool_size(),
+                )
+                .context("failed to open the store pool")?;
+                return web::run_web_server(
+                    pool,
                     &cfg.web.host,
                     cfg.web.port,
                     cfg.web.username.clone(),
@@ -3008,8 +3017,17 @@ fn main() -> Result<()> {
                     threshold: cfg.memory.auto_consolidate_threshold,
                     queue: cfg.consolidate.summarizer.provider.trim() != "none",
                 };
-                return http_api::run_http_server(
+                let store_is_readonly = store.is_readonly();
+                let pool = icm_store::StorePool::with_seed(
                     store,
+                    &db_path,
+                    embedding_dims,
+                    store_is_readonly,
+                    icm_store::default_pool_size(),
+                )
+                .context("failed to open the store pool")?;
+                return http_api::run_http_server(
+                    pool,
                     boxed_emb,
                     addr,
                     token,
