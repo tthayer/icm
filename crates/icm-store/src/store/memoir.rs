@@ -44,6 +44,12 @@ fn row_to_concept(row: &rusqlite::Row) -> rusqlite::Result<Concept> {
 const CONCEPT_COLS: &str = "id, memoir_id, name, definition, labels, confidence, \
                             revision, created_at, updated_at, source_memory_ids";
 
+/// [`CONCEPT_COLS`] qualified with the `concepts` alias `m`, for queries that
+/// also reference `concepts_fts` (both expose `id`/`name`/`definition`/`labels`,
+/// so the unqualified list is ambiguous there).
+const CONCEPT_COLS_M: &str = "m.id, m.memoir_id, m.name, m.definition, m.labels, m.confidence, \
+                            m.revision, m.created_at, m.updated_at, m.source_memory_ids";
+
 fn row_to_link(row: &rusqlite::Row) -> rusqlite::Result<ConceptLink> {
     let relation_str: String = row.get(3)?;
     let relation: Relation = relation_str.parse().unwrap_or(Relation::RelatedTo);
@@ -271,10 +277,11 @@ impl MemoirStore for SqliteStore {
         }
 
         let sql = format!(
-            "SELECT {CONCEPT_COLS} FROM concepts
-             WHERE memoir_id = ?1
-               AND id IN (SELECT id FROM concepts_fts WHERE concepts_fts MATCH ?2)
-             ORDER BY confidence DESC
+            "SELECT {CONCEPT_COLS_M} FROM concepts_fts fts
+             JOIN concepts m ON m.rowid = fts.rowid
+             WHERE m.memoir_id = ?1
+               AND concepts_fts MATCH ?2
+             ORDER BY m.confidence DESC
              LIMIT ?3"
         );
 
@@ -294,9 +301,10 @@ impl MemoirStore for SqliteStore {
         }
 
         let sql = format!(
-            "SELECT {CONCEPT_COLS} FROM concepts
-             WHERE id IN (SELECT id FROM concepts_fts WHERE concepts_fts MATCH ?1)
-             ORDER BY confidence DESC
+            "SELECT {CONCEPT_COLS_M} FROM concepts_fts fts
+             JOIN concepts m ON m.rowid = fts.rowid
+             WHERE concepts_fts MATCH ?1
+             ORDER BY m.confidence DESC
              LIMIT ?2"
         );
 
