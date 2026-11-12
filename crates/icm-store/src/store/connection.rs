@@ -37,6 +37,38 @@ pub(crate) fn collect_rows<T>(
 
 pub(crate) static SQLITE_VEC_INIT: Once = Once::new();
 
+/// Connection-level tuning applied on every open (#6).
+///
+/// Chosen for a mixed read/write, WAL-mode, single-file workload:
+///
+/// - `cache_size=-65536` — 64 MiB page cache (SQLite's default is ~2 MiB).
+/// - `mmap_size=268435456` — 256 MiB of memory-mapped reads.
+/// - `temp_store=MEMORY` — sorts / `GROUP BY` / `json_each` stay in RAM.
+/// - `synchronous=NORMAL` (writable only) — with WAL this drops the fsync
+///   per commit. Durable across application crashes; a power loss can lose
+///   the last few commits (but not corrupt the database). Set
+///   `ICM_SQLITE_SYNCHRONOUS=FULL` to restore per-commit fsync.
+/// - `wal_autocheckpoint=1000` (writable only) — the explicit default.
+///
+/// Best-effort: an unsupported pragma (e.g. `mmap_size` on an unusual VFS)
+/// must not fail an open, so errors are ignored.
+pub(crate) fn apply_tuning(conn: &Connection, writable: bool) {
+    let synchronous = match std::env::var("ICM_SQLITE_SYNCHRONOUS") {
+        Ok(v) if v.eq_ignore_ascii_case("full") => "FULL",
+        _ => "NORMAL",
+    };
+    let mut sql = String::from(
+        "PRAGMA cache_size=-65536; PRAGMA mmap_size=268435456; PRAGMA temp_store=MEMORY;",
+    );
+    if writable {
+        sql.push_str(&format!(
+            "PRAGMA synchronous={synchronous}; PRAGMA wal_autocheckpoint=1000;"
+        ));
+    }
+    let _ = conn.execute_batch(&sql);
+}
+
+
 pub(crate) fn ensure_sqlite_vec() {
     SQLITE_VEC_INIT.call_once(|| unsafe {
         #[allow(clippy::missing_transmute_annotations)]
@@ -74,13 +106,15 @@ pub(crate) fn open_readonly_uri(path: &Path, immutable: bool) -> IcmResult<Conne
     } else {
         format!("file:{encoded}?mode=ro")
     };
-    Connection::open_with_flags(
+    let conn = Connection::open_with_flags(
         uri,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
             | rusqlite::OpenFlags::SQLITE_OPEN_URI
             | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(|e| IcmError::Database(format!("cannot open database read-only: {e}")))
+    .map_err(|e| IcmError::Database(format!("cannot open database read-only: {e}")))?;
+    apply_tuning(&conn, false);
+    Ok(conn)
 }
 
 /// Open a long-lived read-only connection (issue #319).
@@ -116,4 +150,39 @@ pub(crate) fn open_readonly_connection(path: &Path) -> IcmResult<Connection> {
          this point will not be visible until the connection is reopened"
     );
     open_readonly_uri(path, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pragma_i64(conn: &Connection, name: &str) -> i64 {
+        conn.query_row(&format!("PRAGMA {name};"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn writable_tuning_sets_cache_temp_store_and_checkpoint() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_tuning(&conn, true);
+        assert_eq!(pragma_i64(&conn, "cache_size"), -65536);
+        assert_eq!(pragma_i64(&conn, "temp_store"), 2); // MEMORY
+        assert_eq!(pragma_i64(&conn, "wal_autocheckpoint"), 1000);
+        // synchronous is NORMAL (1) unless ICM_SQLITE_SYNCHRONOUS=FULL.
+        let sync = pragma_i64(&conn, "synchronous");
+        assert!(
+            sync == 1 || std::env::var("ICM_SQLITE_SYNCHRONOUS").is_ok(),
+            "expected synchronous=NORMAL, got {sync}"
+        );
+    }
+
+    #[test]
+    fn read_only_tuning_leaves_synchronous_at_default() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_tuning(&conn, false);
+        assert_eq!(pragma_i64(&conn, "cache_size"), -65536);
+        assert_eq!(pragma_i64(&conn, "temp_store"), 2);
+        // Not touched on the read-only path: SQLite's default is FULL (2).
+        assert_eq!(pragma_i64(&conn, "synchronous"), 2);
+    }
 }

@@ -90,6 +90,7 @@ impl SqliteStore {
             .map_err(|e| IcmError::Database(format!("cannot open database: {e}")))?;
         conn.execute_batch("PRAGMA busy_timeout=30000;")
             .map_err(db_err)?;
+        apply_tuning(&conn, true);
         Ok(Self {
             conn,
             cache: Mutex::new(new_cache()),
@@ -227,6 +228,7 @@ impl SqliteStore {
         }
         conn.execute_batch("PRAGMA busy_timeout=30000;")
             .map_err(db_err)?;
+        apply_tuning(&conn, true);
 
         Ok(Self {
             conn,
@@ -247,6 +249,7 @@ impl SqliteStore {
             .map_err(|e| IcmError::Database(format!("cannot open in-memory db: {e}")))?;
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000;")
             .map_err(db_err)?;
+        apply_tuning(&conn, false);
         init_db_with_dims(&conn, embedding_dims)?;
         Ok(Self {
             conn,

@@ -1,6 +1,6 @@
 //! Web dashboard for ICM — Axum HTTP server with embedded SvelteKit SPA.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Result;
 use axum::{
@@ -16,7 +16,7 @@ use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 
 use icm_core::{FeedbackStore, Importance, MemoirStore, MemoryStore};
-use icm_store::Store;
+use icm_store::{PooledStore, StorePool};
 
 use crate::config::write_secret_file;
 
@@ -38,7 +38,7 @@ struct WebAssets;
 
 #[derive(Clone)]
 pub struct AppState {
-    store: Arc<Mutex<Store>>,
+    store: Arc<StorePool>,
     username: String,
     password: String,
 }
@@ -344,14 +344,14 @@ fn build_app(state: AppState) -> Router {
 
 #[tokio::main]
 pub async fn run_web_server(
-    store: Store,
+    store_pool: StorePool,
     host: &str,
     port: u16,
     username: String,
     password: String,
 ) -> Result<()> {
     let state = AppState {
-        store: Arc::new(Mutex::new(store)),
+        store: Arc::new(store_pool),
         username,
         password,
     };
@@ -535,17 +535,11 @@ fn importance_str(imp: Importance) -> &'static str {
     }
 }
 
-/// Lock the store, recovering from a poisoned mutex. The store keeps its own
-/// consistency through SQLite transactions, so a panic in one handler must
-/// not permanently kill every subsequent request — with a plain `unwrap()`,
-/// one poisoned lock cascaded panics across all handlers for the lifetime of
-/// the process (audit finding; also the largest cluster of forbidden
-/// `unwrap()` calls in the repo).
-fn lock_store(state: &AppState) -> std::sync::MutexGuard<'_, Store> {
-    state
-        .store
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// Check out a connection from the store pool (issue #1). Blocks while every
+/// member is busy and never fails; the guard returns the connection on drop
+/// (including during a panic, so one failing handler cannot starve the rest).
+fn lock_store(state: &AppState) -> PooledStore<'_> {
+    state.store.checkout()
 }
 
 // ---------------------------------------------------------------------------
@@ -982,11 +976,12 @@ async fn api_memoir_detail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use icm_store::Store;
     use tower::ServiceExt;
 
     fn test_state() -> AppState {
         AppState {
-            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
+            store: Arc::new(StorePool::from_single(Store::in_memory().unwrap())),
             username: "admin".into(),
             password: "secret".into(),
         }
@@ -1036,32 +1031,25 @@ mod tests {
         );
     }
 
-    /// Audit regression: a panic inside one handler used to poison the store
-    /// mutex, making every subsequent `lock().unwrap()` panic in cascade for
-    /// the lifetime of the process. `lock_store` must recover the guard.
+    /// Issue #1: the shared `Mutex<Store>` is gone. A panic inside one handler
+    /// must not lose the connection it was holding — `PooledStore::drop` runs
+    /// during unwinding and returns the member, and the pool never poisons.
     #[test]
-    fn lock_store_recovers_from_a_poisoned_mutex() {
-        let state = AppState {
-            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
-            username: "u".into(),
-            password: "p".into(),
-        };
-
-        // Poison the mutex: panic while holding the guard on another thread.
-        let poisoner = state.clone();
+    fn a_panicking_handler_returns_its_connection_to_the_pool() {
+        let state = test_state();
+        let before = state.store.idle_len();
+        let clone = state.clone();
         let _ = std::thread::spawn(move || {
-            let _guard = poisoner.store.lock().unwrap();
-            panic!("intentional poison");
+            let _guard = lock_store(&clone);
+            panic!("intentional panic while holding a connection");
         })
         .join();
-        assert!(state.store.is_poisoned(), "setup: mutex must be poisoned");
-
-        // The recovering lock still yields a working store.
-        let store = lock_store(&state);
-        assert!(
-            store.stats().is_ok(),
-            "store must remain usable after poison"
+        assert_eq!(
+            state.store.idle_len(),
+            before,
+            "the connection must be back in the pool after the panic"
         );
+        assert!(lock_store(&state).stats().is_ok());
     }
 
     #[test]
@@ -1166,8 +1154,8 @@ mod tests {
             );
         }
         assert!(
-            state.store.try_lock().is_ok(),
-            "store lock must be free after the request"
+            state.store.idle_len() == state.store.size(),
+            "all pooled connections must be free after the request"
         );
     }
 
@@ -1267,9 +1255,9 @@ mod tests {
         assert!(graph.edges.is_empty());
     }
 
-    fn state_with(store: Store) -> AppState {
+    fn state_with(store: icm_store::Store) -> AppState {
         AppState {
-            store: Arc::new(Mutex::new(store)),
+            store: Arc::new(StorePool::from_single(store)),
             username: "u".into(),
             password: "p".into(),
         }
