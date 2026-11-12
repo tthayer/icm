@@ -117,6 +117,15 @@ pub struct MemoryConfig {
     pub auto_consolidate_enabled: bool,
     /// Number of entries in a topic before auto-consolidation triggers.
     pub auto_consolidate_threshold: usize,
+    /// Days of `hook_events` telemetry to keep. The consolidation task
+    /// (`icm consolidate` / `icm consolidate-all`) prunes anything older.
+    ///
+    /// `hook_events` is pure hook telemetry (audited via `icm hook-log` /
+    /// `icm hook-stats`); nothing reads it during recall or store, so it is
+    /// safe to bound. `0` disables pruning (keep everything). A real
+    /// single-user store had reached ~107k rows / ~10 MB because nothing
+    /// ever pruned it.
+    pub hook_events_retention_days: u64,
 }
 
 /// Embedding model settings.
@@ -440,6 +449,7 @@ impl Default for MemoryConfig {
             prune_threshold: 0.1,
             auto_consolidate_enabled: false,
             auto_consolidate_threshold: 10,
+            hook_events_retention_days: 30,
         }
     }
 }
@@ -612,6 +622,7 @@ decay_rate = 0.90
         assert_eq!(config.memory.decay_rate, 0.90);
         // Other fields should be defaults
         assert!(config.extraction.enabled);
+        assert_eq!(config.memory.hook_events_retention_days, 30);
     }
 
     #[test]

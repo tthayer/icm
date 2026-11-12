@@ -2693,6 +2693,9 @@ fn main() -> Result<()> {
             summarizer_max_tokens,
         } => {
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            // Housekeeping alongside the consolidation task: bound the hook
+            // telemetry table so a long-lived store does not accumulate it.
+            prune_hook_events_for_retention(&store, cfg.memory.hook_events_retention_days);
             let outcome = cmd_consolidate(
                 &store,
                 &topic,
@@ -2724,6 +2727,7 @@ fn main() -> Result<()> {
             dry_run,
         } => {
             let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            prune_hook_events_for_retention(&store, cfg.memory.hook_events_retention_days);
             cmd_consolidate_all(
                 &store,
                 threshold,
@@ -10341,6 +10345,33 @@ pub(crate) fn consolidate_in_passes(
 
 /// `icm consolidate` — see [`consolidate_in_passes`].
 #[allow(clippy::too_many_arguments)]
+/// Prune `hook_events` older than `retention_days` as part of the
+/// consolidation maintenance task.
+///
+/// `hook_events` is hook telemetry only (read via `icm hook-log` /
+/// `icm hook-stats`); no recall/store path depends on it, so a bound is safe.
+/// `retention_days == 0` keeps everything. Best-effort: a failure is logged
+/// and never fails the consolidation. Returns the rows removed.
+fn prune_hook_events_for_retention(store: &Store, retention_days: u64) -> usize {
+    if retention_days == 0 {
+        return 0;
+    }
+    let cutoff =
+        (chrono::Utc::now() - chrono::Duration::days(retention_days as i64)).to_rfc3339();
+    match store.prune_hook_events(&cutoff) {
+        Ok(n) => {
+            if n > 0 {
+                println!("Pruned {n} hook_events older than {retention_days} days.");
+            }
+            n
+        }
+        Err(e) => {
+            eprintln!("[consolidate] hook_events prune skipped: {e}");
+            0
+        }
+    }
+}
+
 fn cmd_consolidate(
     store: &Store,
     topic: &str,
